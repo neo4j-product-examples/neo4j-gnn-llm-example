@@ -38,6 +38,7 @@ class STaRKQADataset(InMemoryDataset):
         self.reltype_embedding_dict = torch.load(os.path.join(os.path.dirname(__file__), 'data-loading/emb/prime/text-embedding-ada-002/doc/reltype_emb_dict.pt'))
         self.query_embedding_dict = torch.load(os.path.join(os.path.dirname(__file__), 'data-loading/emb/prime/text-embedding-ada-002/query/query_emb_dict.pt'))
         self.triplet_embedding_dict = torch.load(os.path.join(os.path.dirname(__file__), 'data-loading/emb/prime/text-embedding-ada-002/doc/triplet_sentence_emb_dict.pt'))
+        self.tokens_per_node_desc = torch.load('data-loading/tokens_per_description.pt')
 
         super().__init__(root, force_reload=force_reload)
 
@@ -79,8 +80,13 @@ class STaRKQADataset(InMemoryDataset):
                 t1 = time.time()
                 query_emb = self.query_embedding_dict[qa_row[0]].numpy()[0]
                 with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
-                    topk_node_ids = self.get_nodes_by_vector_search(query_emb, cypher_config["k_nodes"], driver)
-                    # Variations of cypher queries are supported here
+                    if 'node_types' in cypher_config:
+                        # take eg. take top3 from the 4 most occurring node_types.
+                        topk_node_ids = self.get_topk_for_topl_node_types(query_emb, driver, k=cypher_config['k_nodes'],
+                                                                          l=cypher_config['node_types'],
+                                                                          big_k = cypher_config['big_k'])
+                    else:
+                        topk_node_ids = self.get_nodes_by_vector_search(query_emb, cypher_config["k_nodes"], driver)
                     subgraph_rels = self.get_subgraph_rels(topk_node_ids, cypher_config["cypher_query_type"], driver)
                     base_subgraph_rels[index] = subgraph_rels
                 print(f"Cypher query retrieval for {index} took {time.time() - t1} seconds.")
@@ -135,7 +141,9 @@ class STaRKQADataset(InMemoryDataset):
 
             if self.algo_config_version in [1]:
                 with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)) as driver:
-                    topn_nodes = self.get_topn_similar_nodes(query_emb, unique_nodes.tolist(), driver, pcst_config["prized_nodes"])
+                    # topn_nodes = self.get_nodes_by_vector_search(query_emb, pcst_config["prized_nodes"], driver)
+                    # topn_nodes = self.get_topn_similar_nodes(query_emb, unique_nodes.tolist(), driver, pcst_config["prized_nodes"])
+                    topn_nodes = self.get_topn_similar_nodes_fast(query_emb, unique_nodes.tolist(), driver, pcst_config['prized_nodes']) #might return fewer, but usually don'tN
                 mapped_topn_node_ids = [id_map[node] for node in topn_nodes if node in id_map.keys()]
 
                 top_edges, second_top_edges = self.get_edges_by_reltype_vector_search(qa_row[0], subgraph_rels)
@@ -149,11 +157,10 @@ class STaRKQADataset(InMemoryDataset):
                 topk_edge_ids = self.get_edges_by_vector_search(qa_row[0], subgraph_rels, pcst_config["k_edges"])
                 node_prizes, edge_prizes = assign_prizes_topk(pcst_base_graph_topology, mapped_topn_node_ids, topk_edge_ids)
 
-            pcst, inner_id_mapping, selected_nodes, selected_edges = compute_pcst(pcst_base_graph_topology,
-                                                                                  node_prizes, edge_prizes)
-
-            reverse_id_map = {v: k for k, v in id_map.items()}
-            pcst_nodes_original_ids = [reverse_id_map[intermediate_id] for intermediate_id in selected_nodes]
+            (pcst, pcst_nodes_original_ids,
+             reverse_id_map, selected_edges) = self.run_pcst(pcst_base_graph_topology, node_prizes=node_prizes,
+                                                              edge_prizes=edge_prizes, id_map=id_map,
+                                                              max_tokens=pcst_config.get("max_tokens", None))
             pcst_nodes[index] = pcst_nodes_original_ids
 
             # Retrieve node embedding, label and textual graph description
@@ -214,6 +221,19 @@ class STaRKQADataset(InMemoryDataset):
         return [rec.data()['nodeId'] for rec in res.records]
 
 
+    def get_topn_similar_nodes_fast(self, query_emb: np.ndarray, basegraph_node_ids: List, driver: Driver, top_nodes: int) -> list:
+        res = driver.execute_query("""
+                CALL db.index.vector.queryNodes($index, $k, $query_embedding) YIELD node
+                RETURN node.nodeId AS nodeId
+                """,
+                                   parameters_={
+                                       "index": "text_embeddings",
+                                       "k": 100*top_nodes,
+                                       "query_embedding": query_emb})
+        top_node_ids = [rec.data()['nodeId'] for rec in res.records]
+        top_nodes_ordered = [node_id for node_id in top_node_ids if node_id in basegraph_node_ids]
+        return top_nodes_ordered
+
     def get_topn_similar_nodes(self, query_emb: np.ndarray, node_ids: List, driver: Driver, top_nodes: int) -> List:
         res = driver.execute_query("""
         UNWIND $nodeIds AS nodeId
@@ -229,6 +249,27 @@ class STaRKQADataset(InMemoryDataset):
 
         return top_n_nodeIds.tolist()
 
+    def get_nodes_grouped_by_label(self, query_embedding: np.ndarray, driver: Driver, k=4):
+        """
+        Given a prompt, encode it with OpenAI's API and search for similar nodes in the SKB graph in Neo4j
+
+        :param driver:
+        :return: A list of 4 node-ids that are most similar to the prompt
+        """
+        res = driver.execute_query("""
+        CALL db.index.vector.queryNodes($index, $k, $query_embedding) YIELD node, score
+        RETURN node.nodeId AS nodeId, labels(node)[0] AS nodeLabel, score
+        """,
+                                   parameters_={
+                                       "index": "text_embeddings",
+                                       "k": k,
+                                       "query_embedding": query_embedding})
+
+        nodes = {rec['nodeLabel']: [] for rec in res.records}
+        for rec in res.records:
+            # nodes[rec['nodeLabel']].append((rec['nodeId'], rec['score']))
+            nodes[rec['nodeLabel']].append(rec['nodeId'])
+        return nodes
 
     def get_subgraph_rels(self, node_ids: List, cypher_query: str, driver: Driver):
         if cypher_query == "1hop":
@@ -296,6 +337,36 @@ class STaRKQADataset(InMemoryDataset):
 
         return pd.DataFrame([rec.data() for rec in res.records])
 
+    def get_subgraph_rels_1hop_alt(node_ids: list, top_node_labels: list, driver: Driver):
+        res = driver.execute_query("""
+            UNWIND $nodeIds AS nodeId
+            MATCH (h {nodeId:nodeId})-[r]-(t) WHERE labels(t)[0] IN $topNodeLabels
+
+            RETURN
+            h.nodeId as src,
+            t.nodeId as tgt,
+            type(r) as relType,
+            labels(h)[0] as srcType,
+            labels(t)[0] as tgtType
+        """,
+                                   parameters_={'nodeIds': node_ids, 'topNodeLabels': top_node_labels})
+        return pd.DataFrame([rec.data() for rec in res.records])
+
+    def get_subgraph_1hop_top_nodes(self, node_ids: list, top_node_labels: list, driver: Driver):
+        res = driver.execute_query("""
+            UNWIND $nodeIds AS nodeId
+            MATCH (h {nodeId:nodeId})-[r]-(t) WHERE labels(t)[0] IN $topNodeLabels
+
+            RETURN
+            h.nodeId as src,
+            t.nodeId as tgt,
+            type(r) as relType,
+            labels(h)[0] as srcType,
+            labels(t)[0] as tgtType
+        """,
+                                   parameters_={'nodeIds': node_ids, 'topNodeLabels': top_node_labels})
+        return pd.DataFrame([rec.data() for rec in res.records])
+
     def get_edges_by_vector_search(self, qa_row_id: int, subgraph_rels: DataFrame, k=4) -> np.ndarray:
         """
         Given a prompt find the most similar edges in the subgraph
@@ -358,3 +429,27 @@ class STaRKQADataset(InMemoryDataset):
         """,
                                    parameters_={"node_pairs": node_pairs})
         return pd.DataFrame([rec.data() for rec in res.records])
+
+    def run_pcst(self, pcst_base_graph_topology, node_prizes, edge_prizes, id_map, max_tokens=None):
+        pcst, inner_id_mapping, selected_nodes, selected_edges = compute_pcst(pcst_base_graph_topology,
+                                                                              node_prizes, edge_prizes)
+        reverse_id_map = {v: k for k, v in id_map.items()}
+        pcst_nodes_original_ids = [reverse_id_map[intermediate_id] for intermediate_id in selected_nodes]
+
+        if max_tokens is None or sum([self.tokens_per_node_desc[node_id] for node_id in pcst_nodes_original_ids]) < max_tokens:
+            return pcst, pcst_nodes_original_ids, reverse_id_map, selected_edges
+        else:
+            return self.run_pcst(pcst_base_graph_topology, 0.9*node_prizes, 0.9*edge_prizes, id_map, max_tokens)
+
+    def get_topk_for_topl_node_types(self, query_emb, driver, k, l, big_k):
+        topk_node_ids = self.get_nodes_grouped_by_label(query_emb, driver, k=big_k)
+        node_ids = []
+        top_node_types = sorted(
+            [(node_type, len(top_nodes)) for node_type, top_nodes in topk_node_ids.items()],
+            key=lambda x: x[1], reverse=True)
+        top_node_types = list(zip(*top_node_types))[0]
+        for node_type in top_node_types[:l]:
+            node_ids.extend(topk_node_ids[node_type][:k])
+
+        return node_ids
+

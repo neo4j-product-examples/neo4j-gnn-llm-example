@@ -1,0 +1,6 @@
+edge_embedding_method: "triplet"
+prized_nodes: 25
+k_edges: 4
+top_edge_prize: 0.6
+second_edge_prize: 0.5
+max_tokens: 80_000

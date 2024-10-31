@@ -1,0 +1,6 @@
+big_k: 1_000
+node_types: 4
+k_nodes: 3
+cypher_query_type: "1hop"
+edge_embedding_method: "triplet"
+k_edges: 4
